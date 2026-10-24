@@ -486,6 +486,168 @@ async function getOperation(operationId: string): Promise<OperationRecord> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Artifact helpers (archive listing and download)
+// ---------------------------------------------------------------------------
+
+/** Archive extensions produced by oc-mirror mirror-to-disk. */
+const ARCHIVE_EXTENSION_PATTERN = /\.(tar|tar\.gz|tgz)$/i;
+
+/**
+ * Translate a container-absolute path to the equivalent host path.
+ * HOST_DATA_DIR is injected by mirror-gui.sh so users see paths they can
+ * navigate on their own machine rather than inside the container.
+ */
+function toHostPath(containerPath: string): string {
+  const hostDataDir = process.env.HOST_DATA_DIR;
+  if (!hostDataDir) return containerPath;
+  const containerDataDir = path.resolve(STORAGE_DIR);
+  const resolved = path.resolve(containerPath);
+  if (resolved !== containerDataDir && !resolved.startsWith(containerDataDir + path.sep)) {
+    return containerPath;
+  }
+  return resolved.replace(containerDataDir, hostDataDir);
+}
+
+/**
+ * A mirror destination is shared across operations that target the same
+ * subdirectory. We associate archives with a specific run by comparing each
+ * file's mtime against the operation's startedAt/completedAt window.
+ * The tolerance covers filesystem timestamp granularity and the small gap
+ * between oc-mirror exiting and completedAt being stamped.
+ */
+const ARTIFACT_MTIME_TOLERANCE_MS = 5000;
+
+function isArchiveOfRun(mtimeMs: number, operation: OperationRecord): boolean {
+  const startedMs = new Date(operation.startedAt).getTime();
+  const completedMs = operation.completedAt
+    ? new Date(operation.completedAt).getTime()
+    : Date.now();
+  if (Number.isNaN(startedMs) || Number.isNaN(completedMs)) return false;
+  return (
+    mtimeMs >= startedMs - ARTIFACT_MTIME_TOLERANCE_MS &&
+    mtimeMs <= completedMs + ARTIFACT_MTIME_TOLERANCE_MS
+  );
+}
+
+interface MirrorArtifact {
+  filename: string;
+  sizeBytes: number;
+  lastModified: string;
+  downloadUrl: string;
+}
+
+/**
+ * Read the mirror destination directory and split archives into those that
+ * belong to this operation's run window and those that don't.
+ * Symlinks and non-regular files are ignored — entry.isFile() already returns
+ * false for symlinks, and we re-check with lstat before trusting the result.
+ */
+async function scanOperationArtifacts(
+  operation: OperationRecord,
+  mirrorDir: string,
+): Promise<{ artifacts: MirrorArtifact[]; otherRunArchiveCount: number }> {
+  const entries = await fsp.readdir(mirrorDir, { withFileTypes: true });
+  const artifacts: MirrorArtifact[] = [];
+  let otherRunArchiveCount = 0;
+
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!ARCHIVE_EXTENSION_PATTERN.test(entry.name)) continue;
+
+    let stats: fs.Stats;
+    try {
+      stats = await fsp.lstat(path.join(mirrorDir, entry.name));
+    } catch {
+      continue; // raced deletion — skip rather than fail the entire listing
+    }
+    if (!stats.isFile()) continue; // closed TOCTOU for symlinks
+
+    if (!isArchiveOfRun(stats.mtimeMs, operation)) {
+      otherRunArchiveCount += 1;
+      continue;
+    }
+
+    artifacts.push({
+      filename: entry.name,
+      sizeBytes: stats.size,
+      lastModified: stats.mtime.toISOString(),
+      downloadUrl:
+        `/api/operations/${encodeURIComponent(operation.id)}` +
+        `/artifacts/${encodeURIComponent(entry.name)}/download`,
+    });
+  }
+
+  artifacts.sort((a, b) => a.filename.localeCompare(b.filename));
+  return { artifacts, otherRunArchiveCount };
+}
+
+/** Shared precondition check used by both artifact endpoints. */
+async function resolveArtifactContext(
+  operationId: string,
+): Promise<
+  | { ok: true; operation: OperationRecord; mirrorDir: string }
+  | { ok: false; status: number; body: Record<string, unknown> }
+> {
+  let operation: OperationRecord;
+  try {
+    operation = await getOperation(operationId);
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { ok: false, status: 404, body: { error: 'Operation not found' } };
+    }
+    throw e;
+  }
+
+  if (operation.status !== 'success') {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'Archives are only available for successful operations',
+        status: operation.status,
+      },
+    };
+  }
+
+  if (!operation.mirrorDestination) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'Operation has no mirror destination recorded' },
+    };
+  }
+
+  const mirrorDir = path.resolve(operation.mirrorDestination);
+
+  let dirStats: fs.Stats;
+  try {
+    dirStats = await fsp.lstat(mirrorDir);
+  } catch {
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: 'Mirror destination directory not found',
+        path: mirrorDir,
+        hostPath: toHostPath(mirrorDir),
+      },
+    };
+  }
+
+  if (!dirStats.isDirectory()) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'Mirror destination is not a directory' },
+    };
+  }
+
+  return { ok: true, operation, mirrorDir };
+}
+
+// ---------------------------------------------------------------------------
+
 async function getSystemHealth(): Promise<string> {
   let ocMirrorOk = false;
   try { await execAsync('oc-mirror version'); ocMirrorOk = true; } catch { /* not installed */ }
@@ -1886,6 +2048,84 @@ app.delete('/api/operations/:id', async (req: Request, res: Response) => {
     res.json({ message: 'Operation deleted successfully' });
   } catch {
     res.status(500).json({ error: 'Failed to delete operation' });
+  }
+});
+
+app.get('/api/operations/:id/artifacts', async (req: Request, res: Response) => {
+  try {
+    const context = await resolveArtifactContext(req.params.id);
+    if (!context.ok) return res.status(context.status).json(context.body);
+
+    const { artifacts } = await scanOperationArtifacts(
+      context.operation,
+      context.mirrorDir,
+    );
+
+    res.json({
+      artifacts,
+      mirrorDestination: context.mirrorDir,
+      hostMirrorDestination: toHostPath(context.mirrorDir),
+    });
+  } catch (error: unknown) {
+    console.error('Error listing operation artifacts:', error);
+    res.status(500).json({ error: 'Failed to list operation artifacts' });
+  }
+});
+
+app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request, res: Response) => {
+  try {
+    const context = await resolveArtifactContext(req.params.id);
+    if (!context.ok) return res.status(context.status).json(context.body);
+
+    const requested = req.params.filename || '';
+    const basename = path.basename(requested);
+
+    // Reject if basename() changed anything (traversal, absolute paths, subdirs),
+    // allow only safe characters (oc-mirror names are like mirror_seq1_000000.tar),
+    // and only archive extensions.
+    if (
+      basename !== requested ||
+      !/^[A-Za-z0-9._-]+$/.test(basename) ||
+      !ARCHIVE_EXTENSION_PATTERN.test(basename)
+    ) {
+      return res.status(400).json({ error: 'Invalid archive filename' });
+    }
+
+    const filepath = path.resolve(context.mirrorDir, basename);
+    if (!filepath.startsWith(context.mirrorDir + path.sep)) {
+      return res.status(400).json({ error: 'Invalid archive filename' });
+    }
+
+    // lstat does not follow symlinks — a symlink to /etc/passwd is not a regular file.
+    let stats: fs.Stats;
+    try {
+      stats = await fsp.lstat(filepath);
+    } catch {
+      return res.status(404).json({ error: 'Archive not found' });
+    }
+    if (!stats.isFile()) {
+      return res.status(404).json({ error: 'Archive not found' });
+    }
+
+    // Only serve archives that this operation produced.
+    if (!isArchiveOfRun(stats.mtimeMs, context.operation)) {
+      return res.status(404).json({ error: 'Archive was not produced by this operation' });
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="${basename}"`);
+    res.setHeader(
+      'Content-Type',
+      /\.(tar\.gz|tgz)$/i.test(basename) ? 'application/gzip' : 'application/x-tar',
+    );
+    res.setHeader('Content-Length', String(stats.size));
+    // The global compression() middleware (server/index.ts) would try to gzip a
+    // multi-GB tar, burning CPU and invalidating Content-Length. no-transform opts out.
+    res.setHeader('Cache-Control', 'no-transform');
+
+    res.sendFile(filepath);
+  } catch (error: unknown) {
+    console.error('Error downloading operation artifact:', error);
+    res.status(500).json({ error: 'Failed to download archive' });
   }
 });
 

@@ -61,6 +61,7 @@ import {
   TimesIcon,
   TrashAltIcon,
   SearchIcon,
+  DownloadIcon,
 } from '@patternfly/react-icons';
 import { Table, Thead, Tbody, Tr, Th, Td } from '@patternfly/react-table';
 import { useAlerts } from '../AlertContext';
@@ -98,6 +99,18 @@ interface OptionalFlagsPayload {
   imageTimeout?: string;
   retryDelay?: string;
   retryTimes?: number;
+}
+
+interface MirrorArtifact {
+  filename: string;
+  sizeBytes: number;
+  lastModified: string;
+  downloadUrl: string;
+}
+
+interface ArtifactListing {
+  artifacts: MirrorArtifact[];
+  error?: string;
 }
 
 const DEFAULT_OPTIONAL_FLAGS: OptionalFlags = {
@@ -322,6 +335,8 @@ const MirrorOperations: React.FC = () => {
   const [showStopModal, setShowStopModal] = useState(false);
   const [stopOperationId, setStopOperationId] = useState<string | null>(null);
   const [kebabOpen, setKebabOpen] = useState<Record<string, boolean>>({});
+  const [artifacts, setArtifacts] = useState<Record<string, ArtifactListing | undefined>>({});
+  const [artifactsLoading, setArtifactsLoading] = useState<Record<string, boolean>>({});
   const [hostDataDir, setHostDataDir] = useState('');
   const [now, setNow] = useState(Date.now());
 
@@ -454,6 +469,26 @@ const MirrorOperations: React.FC = () => {
     setNewFolderName('');
     setFolderSelectOpen(false);
   }, [fetchFolders, addSuccessAlert, addDangerAlert]);
+
+  const fetchArtifacts = useCallback(async (operationId: string) => {
+    setArtifactsLoading(prev => ({ ...prev, [operationId]: true }));
+    try {
+      const response = await axios.get<ArtifactListing>(`/api/operations/${operationId}/artifacts`);
+      setArtifacts(prev => ({ ...prev, [operationId]: response.data }));
+    } catch (error: unknown) {
+      const err = error as { response?: { data?: { error?: string } }; message?: string };
+      console.error('Error fetching artifacts:', error);
+      setArtifacts(prev => ({
+        ...prev,
+        [operationId]: {
+          artifacts: [],
+          error: err.response?.data?.error || err.message || 'Failed to load archives',
+        },
+      }));
+    } finally {
+      setArtifactsLoading(prev => ({ ...prev, [operationId]: false }));
+    }
+  }, []);
 
   const fetchOperations = useCallback(async () => {
     try {
@@ -693,6 +728,13 @@ const MirrorOperations: React.FC = () => {
     if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
     if (minutes > 0) return `${minutes}m ${secs}s`;
     return `${secs}s`;
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
+    return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
   };
 
   const scrollToOperations = () => {
@@ -1377,7 +1419,12 @@ const MirrorOperations: React.FC = () => {
                     <Td isActionCell>
                       <Dropdown
                         isOpen={!!kebabOpen[op.id]}
-                        onOpenChange={(open) => setKebabOpen((prev) => ({ ...prev, [op.id]: open }))}
+                        onOpenChange={(open) => {
+                          setKebabOpen((prev) => ({ ...prev, [op.id]: open }));
+                          if (open && op.status === 'success' && op.mirrorDestination) {
+                            void fetchArtifacts(op.id);
+                          }
+                        }}
                         toggle={(toggleRef) => (
                           <MenuToggle
                             ref={toggleRef}
@@ -1418,6 +1465,51 @@ const MirrorOperations: React.FC = () => {
                               Copy Location
                             </DropdownItem>
                           )}
+                          {op.status === 'success' && op.mirrorDestination && (() => {
+                            const listing = artifacts[op.id];
+                            // While loading, show a plain spinner — no DownloadIcon until archives
+                            // are confirmed to exist.
+                            if (artifactsLoading[op.id]) {
+                              return (
+                                <DropdownItem key={`${op.id}-archives-loading`} isDisabled>
+                                  <Spinner size="sm" aria-label="Loading archives" />{' '}Loading archives…
+                                </DropdownItem>
+                              );
+                            }
+                            // Not yet fetched, or fetch errored, or no archives for this run:
+                            // show nothing — do not surface other operations' archives.
+                            if (!listing || listing.error || listing.artifacts.length === 0) {
+                              return null;
+                            }
+                            // DownloadIcon is only visible from this point — after a successful
+                            // fetch that returned at least one archive from this operation.
+                            return listing.artifacts.map((artifact, index) => {
+                              // Name the saved file after the operation so users can identify it.
+                              // Multiple archives get a numeric suffix: "Mirror Operation abc.tar",
+                              // "Mirror Operation abc-2.tar", etc.
+                              const downloadName =
+                                listing.artifacts.length === 1
+                                  ? `${op.name}.tar`
+                                  : index === 0
+                                    ? `${op.name}.tar`
+                                    : `${op.name}-${index + 1}.tar`;
+
+                              return (
+                                <DropdownItem
+                                  key={`${op.id}-archive-${artifact.filename}`}
+                                  icon={<DownloadIcon />}
+                                  component="a"
+                                  href={artifact.downloadUrl}
+                                  download={downloadName}
+                                  onClick={() => setKebabOpen((prev) => ({ ...prev, [op.id]: false }))}
+                                >
+                                  {listing.artifacts.length === 1
+                                    ? `Download archive (${formatBytes(artifact.sizeBytes)})`
+                                    : `Download archive ${index + 1} (${formatBytes(artifact.sizeBytes)})`}
+                                </DropdownItem>
+                              );
+                            });
+                          })()}
                           <Divider key={`${op.id}-div`} component="li" />
                           {op.status === 'running' && (
                             <DropdownItem
