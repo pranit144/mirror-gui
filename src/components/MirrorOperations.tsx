@@ -1557,7 +1557,11 @@ const MirrorOperations: React.FC = () => {
                         isOpen={!!kebabOpen[op.id]}
                         onOpenChange={(open) => {
                           setKebabOpen((prev) => ({ ...prev, [op.id]: open }));
-                          if (open && op.status === 'success' && op.mirrorDestination) {
+                          // Fetch once per session — skip if we already have a result
+                          // or a request is in flight. This prevents "Loading archives…"
+                          // from flashing on every open.
+                          if (open && op.status === 'success' && op.mirrorDestination &&
+                              !artifacts[op.id] && !artifactsLoading[op.id]) {
                             void fetchArtifacts(op.id);
                           }
                         }}
@@ -1617,7 +1621,9 @@ const MirrorOperations: React.FC = () => {
                               );
                             }
                             // Fetch completed but no archives found for this operation.
-                            if (listing.error || listing.artifacts.length === 0) {
+                            // Guard against malformed responses (e.g. non-JSON from the
+                            // SPA catch-all) where listing.artifacts may be undefined.
+                            if (listing.error || !listing.artifacts || listing.artifacts.length === 0) {
                               return (
                                 <DropdownItem
                                   key={`${op.id}-archives-empty`}

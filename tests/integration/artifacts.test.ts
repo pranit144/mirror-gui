@@ -23,10 +23,11 @@ async function seedOperation(
     id: string;
     status: 'success' | 'failed' | 'stopped' | 'running';
     mirrorDestination: string;
+    artifactFiles: string[];
   }> = {},
 ): Promise<string> {
   const id = overrides.id ?? `test-${Math.random().toString(36).slice(2)}`;
-  const record = {
+  const record: Record<string, unknown> = {
     id,
     name: `Mirror Operation ${id.slice(0, 8)}`,
     configFile: 'test.yaml',
@@ -38,6 +39,9 @@ async function seedOperation(
     errorMessage: null,
     logs: [],
   };
+  if (overrides.artifactFiles !== undefined) {
+    record.artifactFiles = overrides.artifactFiles;
+  }
   await fs.promises.writeFile(
     path.join(storageDir, 'operations', `${id}.json`),
     JSON.stringify(record, null, 2),
@@ -87,8 +91,12 @@ describe('Artifact API', () => {
       'apiVersion: operators.coreos.com/v1alpha1\nkind: CatalogSource',
     );
 
-    // Seed operations.
-    successOpId = await seedOperation(storageDir, { status: 'success' });
+    // Seed operations.  The success operation records artifactFiles so that
+    // scanOperationArtifacts uses the definitive list rather than the live scan.
+    successOpId = await seedOperation(storageDir, {
+      status: 'success',
+      artifactFiles: ['mirror_seq1_000000.tar'],
+    });
     failedOpId  = await seedOperation(storageDir, { status: 'failed' });
     stoppedOpId = await seedOperation(storageDir, { status: 'stopped' });
 
@@ -181,12 +189,68 @@ describe('Artifact API', () => {
       const multiOpId = await seedOperation(storageDir, {
         status: 'success',
         mirrorDestination: multiDir,
+        artifactFiles: ['mirror_seq1_000000.tar', 'mirror_seq2_000000.tar'],
       });
 
       const res = await request.get(`/api/operations/${multiOpId}/artifacts`);
       expect(res.status).toBe(200);
       expect(res.body.artifacts[0].filename).toBe('mirror_seq1_000000.tar');
       expect(res.body.artifacts[1].filename).toBe('mirror_seq2_000000.tar');
+    });
+
+    it('scopes listing to artifactFiles when recorded — later overwrites are hidden', async () => {
+      // Simulate the oc-mirror pattern: two operations share the same destination.
+      // Op 1 recorded mirror_000001.tar. Op 2 runs later, overwrites that file,
+      // and records its own mirror_000001.tar. Op 1's listing must remain empty
+      // (the file it produced no longer exists on disk).
+      const sharedDir = path.join(storageDir, 'mirrors', 'shared-dest');
+      await fs.promises.mkdir(sharedDir, { recursive: true });
+
+      // Op 1: created mirror_000001.tar, but now it no longer exists (overwritten).
+      const op1Id = await seedOperation(storageDir, {
+        status: 'success',
+        mirrorDestination: sharedDir,
+        artifactFiles: ['mirror_000001.tar'],
+      });
+
+      // Op 2: owns the current mirror_000001.tar.
+      await fs.promises.writeFile(path.join(sharedDir, 'mirror_000001.tar'), 'op2-content');
+      const op2Id = await seedOperation(storageDir, {
+        status: 'success',
+        mirrorDestination: sharedDir,
+        artifactFiles: ['mirror_000001.tar'],
+      });
+
+      const [res1, res2] = await Promise.all([
+        request.get(`/api/operations/${op1Id}/artifacts`),
+        request.get(`/api/operations/${op2Id}/artifacts`),
+      ]);
+
+      // Op 1's recorded file is gone — empty listing, not Op 2's file.
+      expect(res1.status).toBe(200);
+      expect(res1.body.artifacts).toHaveLength(0);
+
+      // Op 2's file exists — listed correctly.
+      expect(res2.status).toBe(200);
+      expect(res2.body.artifacts).toHaveLength(1);
+      expect(res2.body.artifacts[0].filename).toBe('mirror_000001.tar');
+    });
+
+    it('falls back to live directory scan for operations without artifactFiles', async () => {
+      const legacyDir = path.join(storageDir, 'mirrors', 'legacy-dest');
+      await fs.promises.mkdir(legacyDir, { recursive: true });
+      await fs.promises.writeFile(path.join(legacyDir, 'mirror_000001.tar'), 'legacy');
+
+      // No artifactFiles field — legacy record.
+      const legacyOpId = await seedOperation(storageDir, {
+        status: 'success',
+        mirrorDestination: legacyDir,
+      });
+
+      const res = await request.get(`/api/operations/${legacyOpId}/artifacts`);
+      expect(res.status).toBe(200);
+      expect(res.body.artifacts).toHaveLength(1);
+      expect(res.body.artifacts[0].filename).toBe('mirror_000001.tar');
     });
   });
 

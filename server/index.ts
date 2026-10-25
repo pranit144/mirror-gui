@@ -33,6 +33,8 @@ interface OperationRecord {
   name: string;
   configFile: string;
   mirrorDestination?: string;
+  /** Archive filenames recorded in the mirror destination at operation completion. */
+  artifactFiles?: string[];
   status: 'running' | 'success' | 'failed' | 'stopped';
   startedAt: string;
   completedAt?: string;
@@ -517,42 +519,67 @@ interface MirrorArtifact {
 }
 
 /**
- * List all archives in the operation's mirror destination directory.
- * Symlinks and non-regular files are skipped — entry.isFile() returns false
- * for symlinks, and we re-check with lstat to close the TOCTOU gap.
- * We intentionally do not filter by mtime: oc-mirror writes archives
- * incrementally and can update timestamps in ways that make time-window
- * filtering unreliable. The destination path itself (stored in the operation
- * record) is already the scope — every archive in it belongs to runs that
- * targeted this location.
+ * List archives for an operation.
+ *
+ * When the operation record includes `artifactFiles` (set at completion time),
+ * we use that definitive list and only include files that still exist on disk.
+ * This ensures each operation shows only the archives it produced, even when a
+ * later operation targeting the same destination has overwritten the files.
+ *
+ * For older records without `artifactFiles`, we fall back to a live directory
+ * scan and return every archive present.
+ *
+ * Symlinks and non-regular files are always skipped.
  */
 async function scanOperationArtifacts(
   operation: OperationRecord,
   mirrorDir: string,
 ): Promise<{ artifacts: MirrorArtifact[] }> {
-  const entries = await fsp.readdir(mirrorDir, { withFileTypes: true });
   const artifacts: MirrorArtifact[] = [];
 
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    if (!ARCHIVE_EXTENSION_PATTERN.test(entry.name)) continue;
+  const makeDownloadUrl = (filename: string) =>
+    `/api/operations/${encodeURIComponent(operation.id)}` +
+    `/artifacts/${encodeURIComponent(filename)}/download`;
 
-    let stats: fs.Stats;
-    try {
-      stats = await fsp.lstat(path.join(mirrorDir, entry.name));
-    } catch {
-      continue; // raced deletion — skip rather than fail the entire listing
+  if (operation.artifactFiles) {
+    // Use the recorded list — only include files that still exist on disk.
+    for (const filename of operation.artifactFiles) {
+      if (!ARCHIVE_EXTENSION_PATTERN.test(filename)) continue;
+      const filePath = path.join(mirrorDir, filename);
+      let stats: fs.Stats;
+      try {
+        stats = await fsp.lstat(filePath);
+      } catch {
+        continue; // file was overwritten or deleted by a later operation
+      }
+      if (!stats.isFile()) continue;
+      artifacts.push({
+        filename,
+        sizeBytes: stats.size,
+        lastModified: stats.mtime.toISOString(),
+        downloadUrl: makeDownloadUrl(filename),
+      });
     }
-    if (!stats.isFile()) continue; // lstat re-check: symlinks are not regular files
-
-    artifacts.push({
-      filename: entry.name,
-      sizeBytes: stats.size,
-      lastModified: stats.mtime.toISOString(),
-      downloadUrl:
-        `/api/operations/${encodeURIComponent(operation.id)}` +
-        `/artifacts/${encodeURIComponent(entry.name)}/download`,
-    });
+  } else {
+    // Legacy path: no recorded list, scan the directory.
+    const entries = await fsp.readdir(mirrorDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!ARCHIVE_EXTENSION_PATTERN.test(entry.name)) continue;
+      let stats: fs.Stats;
+      try {
+        stats = await fsp.lstat(path.join(mirrorDir, entry.name));
+      } catch {
+        continue;
+      }
+      if (!stats.isFile()) continue;
+      artifacts.push({
+        filename: entry.name,
+        sizeBytes: stats.size,
+        lastModified: stats.mtime.toISOString(),
+        downloadUrl: makeDownloadUrl(entry.name),
+      });
+    }
   }
 
   artifacts.sort((a, b) => a.filename.localeCompare(b.filename));
@@ -1941,12 +1968,33 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
         }
       }
 
+      // Snapshot the archive filenames that exist in the mirror destination
+      // right now, while the operation has just finished. Storing them in the
+      // record means each operation's artifact listing is scoped to exactly
+      // what it produced, even if a later operation targeting the same
+      // destination overwrites those files (oc-mirror resets mirror_000001.tar
+      // on every run to the same location).
+      let artifactFiles: string[] | undefined;
+      if (finalStatus === 'success' && operation.mirrorDestination) {
+        try {
+          const entries = await fsp.readdir(operation.mirrorDestination, { withFileTypes: true });
+          const found = entries
+            .filter(e => e.isFile() && ARCHIVE_EXTENSION_PATTERN.test(e.name))
+            .map(e => e.name)
+            .sort();
+          if (found.length > 0) artifactFiles = found;
+        } catch {
+          // mirror destination may not exist yet (e.g. dry-run) — skip
+        }
+      }
+
       await updateOperation(operationId, {
         status: finalStatus,
         completedAt,
         duration,
         errorMessage,
         logs: logs.split('\n'),
+        ...(artifactFiles ? { artifactFiles } : {}),
       });
     });
 
