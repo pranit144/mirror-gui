@@ -1467,26 +1467,33 @@ const MirrorOperations: React.FC = () => {
                           )}
                           {op.status === 'success' && op.mirrorDestination && (() => {
                             const listing = artifacts[op.id];
-                            // While loading, show a plain spinner — no DownloadIcon until archives
-                            // are confirmed to exist.
-                            if (artifactsLoading[op.id]) {
+                            // While the fetch is in flight (or hasn't resolved yet), always
+                            // show a visible loading item so the user can see the feature exists.
+                            if (artifactsLoading[op.id] || !listing) {
                               return (
-                                <DropdownItem key={`${op.id}-archives-loading`} isDisabled>
+                                <DropdownItem
+                                  key={`${op.id}-archives-loading`}
+                                  isDisabled
+                                  icon={<DownloadIcon />}
+                                >
                                   <Spinner size="sm" aria-label="Loading archives" />{' '}Loading archives…
                                 </DropdownItem>
                               );
                             }
-                            // Not yet fetched, or fetch errored, or no archives for this run:
-                            // show nothing — do not surface other operations' archives.
-                            if (!listing || listing.error || listing.artifacts.length === 0) {
-                              return null;
+                            // Fetch completed but no archives found for this operation.
+                            if (listing.error || listing.artifacts.length === 0) {
+                              return (
+                                <DropdownItem
+                                  key={`${op.id}-archives-empty`}
+                                  isDisabled
+                                  icon={<DownloadIcon />}
+                                >
+                                  No archives available
+                                </DropdownItem>
+                              );
                             }
-                            // DownloadIcon is only visible from this point — after a successful
-                            // fetch that returned at least one archive from this operation.
+                            // Archives confirmed — show one download item per archive.
                             return listing.artifacts.map((artifact, index) => {
-                              // Name the saved file after the operation so users can identify it.
-                              // Multiple archives get a numeric suffix: "Mirror Operation abc.tar",
-                              // "Mirror Operation abc-2.tar", etc.
                               const downloadName =
                                 listing.artifacts.length === 1
                                   ? `${op.name}.tar`
