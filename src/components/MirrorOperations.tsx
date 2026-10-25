@@ -776,6 +776,11 @@ const MirrorOperations: React.FC = () => {
     if (!deleteOperationId) return;
     try {
       await axios.delete(`/api/operations/${deleteOperationId}`);
+      setArtifacts((prev) => {
+        const next = { ...prev };
+        delete next[deleteOperationId];
+        return next;
+      });
       addSuccessAlert('Operation deleted successfully!');
       fetchOperations();
       setShowDeleteModal(false);
@@ -949,6 +954,11 @@ const MirrorOperations: React.FC = () => {
       setCheckedOpIds(prev => {
         const next = new Set(prev);
         for (const id of ids) next.delete(id);
+        return next;
+      });
+      setArtifacts((prev) => {
+        const next = { ...prev };
+        for (const id of ids) delete next[id];
         return next;
       });
       addSuccessAlert(`Deleted ${ids.length} operation${ids.length > 1 ? 's' : ''}`);
@@ -1557,12 +1567,15 @@ const MirrorOperations: React.FC = () => {
                         isOpen={!!kebabOpen[op.id]}
                         onOpenChange={(open) => {
                           setKebabOpen((prev) => ({ ...prev, [op.id]: open }));
-                          // Fetch once per session — skip if we already have a result
-                          // or a request is in flight. This prevents "Loading archives…"
-                          // from flashing on every open.
+                          // Fetch when opening: skip while in flight. Cache successful
+                          // listings for the session, but retry after a prior failure so
+                          // a transient error does not permanently hide archives.
                           if (open && op.status === 'success' && op.mirrorDestination &&
-                              !artifacts[op.id] && !artifactsLoading[op.id]) {
-                            void fetchArtifacts(op.id);
+                              !artifactsLoading[op.id]) {
+                            const listing = artifacts[op.id];
+                            if (!listing || listing.error) {
+                              void fetchArtifacts(op.id);
+                            }
                           }
                         }}
                         toggle={(toggleRef) => (

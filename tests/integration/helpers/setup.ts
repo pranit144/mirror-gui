@@ -15,6 +15,7 @@ export async function ensureTestDirs(): Promise<void> {
     path.join(storageDir, 'configs'),
     path.join(storageDir, 'operations'),
     path.join(storageDir, 'logs'),
+    path.join(storageDir, 'artifacts'),
     path.join(storageDir, 'cache'),
     path.join(storageDir, 'mirrors'),
     path.join(storageDir, 'mirrors', 'default'),

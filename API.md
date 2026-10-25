@@ -650,8 +650,9 @@ Start a new mirror operation.
 ```
 
 **Notes:**
-- Mirror archives are saved persistently to the host filesystem at `data/mirrors/{subdirectory}/` on the host
-- Files survive container restarts
+- oc-mirror writes archives into the shared destination `data/mirrors/{subdirectory}/` on the host (filenames such as `mirror_000001.tar` are reused across runs)
+- On successful completion, mirror-gui copies those archives into `data/artifacts/{operationId}/` so each operation keeps its own downloadable bytes across subsequent runs and container restarts
+- The shared destination (including `working-dir/`) remains the live oc-mirror workspace
 - The full host path is displayed in the operation details after completion
 
 #### GET /api/operations/:id/details
@@ -725,8 +726,59 @@ Stop a running operation.
 }
 ```
 
+#### GET /api/operations/:id/artifacts
+List downloadable mirror archives for a successful operation.
+
+On success, archives are **copied** into per-operation storage at
+`data/artifacts/{operationId}/`. Listing and download prefer that store so a later
+run that overwrites `mirror_000001.tar` in the shared mirror destination cannot
+replace another operation's bytes. The shared destination under
+`data/mirrors/{subdir}/` (including `working-dir/`) continues to function as the
+live oc-mirror workspace.
+
+**Parameters:**
+- `id`: Operation ID
+
+**Response:**
+```json
+{
+  "artifacts": [
+    {
+      "filename": "mirror_000001.tar",
+      "sizeBytes": 1048576,
+      "lastModified": "2024-01-15T10:45:00.000Z",
+      "downloadUrl": "/api/operations/abc123/artifacts/mirror_000001.tar/download"
+    }
+  ],
+  "mirrorDestination": "/app/data/mirrors/default",
+  "hostMirrorDestination": "/host/path/data/mirrors/default"
+}
+```
+
+**Errors:**
+- `404` — operation not found, or neither a mirror destination nor persisted archives exist
+- `409` — operation is not in `success` status
+
+#### GET /api/operations/:id/artifacts/:filename/download
+Stream a single archive. Serves the per-operation copy when present; falls back
+to the live mirror destination only for legacy records without a persisted store.
+
+**Parameters:**
+- `id`: Operation ID
+- `filename`: Archive basename (e.g. `mirror_000001.tar`)
+
+**Response:** Binary archive stream with `Content-Disposition: attachment`.
+
+#### GET /api/operations/:id/working-dir
+Browse the live `working-dir/` tree under the operation's mirror destination
+(not snapshotted per operation).
+
+**Query:**
+- `path` (optional): Relative subdirectory within `working-dir`
+
 #### DELETE /api/operations/:id
-Delete an operation record and its associated log file.
+Delete an operation record, its log file, and any persisted archive copies under
+`data/artifacts/{id}/`. Does not delete the shared mirror destination.
 
 **Parameters:**
 - `id`: Operation ID

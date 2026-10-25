@@ -49,6 +49,18 @@ async function seedOperation(
   return id;
 }
 
+/** Seed a per-operation archive copy under data/artifacts/{id}/. */
+async function seedPersistedArtifact(
+  storageDir: string,
+  operationId: string,
+  filename: string,
+  content: string,
+): Promise<void> {
+  const dir = path.join(storageDir, 'artifacts', operationId);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(path.join(dir, filename), content);
+}
+
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
@@ -198,42 +210,71 @@ describe('Artifact API', () => {
       expect(res.body.artifacts[1].filename).toBe('mirror_seq2_000000.tar');
     });
 
-    it('scopes listing to artifactFiles when recorded — later overwrites are hidden', async () => {
-      // Simulate the oc-mirror pattern: two operations share the same destination.
-      // Op 1 recorded mirror_000001.tar. Op 2 runs later, overwrites that file,
-      // and records its own mirror_000001.tar. Op 1's listing must remain empty
-      // (the file it produced no longer exists on disk).
+    it('keeps each operation archive after a later run overwrites mirror_000001.tar', async () => {
+      // oc-mirror reuses the same filename in a shared destination. Persistence
+      // must copy each run's bytes aside so both ops remain downloadable.
       const sharedDir = path.join(storageDir, 'mirrors', 'shared-dest');
       await fs.promises.mkdir(sharedDir, { recursive: true });
 
-      // Op 1: created mirror_000001.tar, but now it no longer exists (overwritten).
       const op1Id = await seedOperation(storageDir, {
         status: 'success',
         mirrorDestination: sharedDir,
         artifactFiles: ['mirror_000001.tar'],
       });
+      await seedPersistedArtifact(storageDir, op1Id, 'mirror_000001.tar', 'op1-original-bytes');
 
-      // Op 2: owns the current mirror_000001.tar.
-      await fs.promises.writeFile(path.join(sharedDir, 'mirror_000001.tar'), 'op2-content');
+      // Later run overwrites the shared destination with a new archive of the same name.
+      await fs.promises.writeFile(path.join(sharedDir, 'mirror_000001.tar'), 'op2-new-bytes');
       const op2Id = await seedOperation(storageDir, {
         status: 'success',
         mirrorDestination: sharedDir,
         artifactFiles: ['mirror_000001.tar'],
       });
+      await seedPersistedArtifact(storageDir, op2Id, 'mirror_000001.tar', 'op2-new-bytes');
 
       const [res1, res2] = await Promise.all([
         request.get(`/api/operations/${op1Id}/artifacts`),
         request.get(`/api/operations/${op2Id}/artifacts`),
       ]);
 
-      // Op 1's recorded file is gone — empty listing, not Op 2's file.
       expect(res1.status).toBe(200);
-      expect(res1.body.artifacts).toHaveLength(0);
+      expect(res1.body.artifacts).toHaveLength(1);
+      expect(res1.body.artifacts[0].filename).toBe('mirror_000001.tar');
+      expect(res1.body.artifacts[0].sizeBytes).toBe(Buffer.byteLength('op1-original-bytes'));
 
-      // Op 2's file exists — listed correctly.
       expect(res2.status).toBe(200);
       expect(res2.body.artifacts).toHaveLength(1);
       expect(res2.body.artifacts[0].filename).toBe('mirror_000001.tar');
+      expect(res2.body.artifacts[0].sizeBytes).toBe(Buffer.byteLength('op2-new-bytes'));
+
+      const [dl1, dl2] = await Promise.all([
+        request.get(`/api/operations/${op1Id}/artifacts/mirror_000001.tar/download`),
+        request.get(`/api/operations/${op2Id}/artifacts/mirror_000001.tar/download`),
+      ]);
+      expect(dl1.status).toBe(200);
+      expect(dl1.text).toBe('op1-original-bytes');
+      expect(dl2.status).toBe(200);
+      expect(dl2.text).toBe('op2-new-bytes');
+    });
+
+    it('serves persisted archives when the shared mirror destination is gone', async () => {
+      const goneDir = path.join(storageDir, 'mirrors', 'gone-dest');
+      const opId = await seedOperation(storageDir, {
+        status: 'success',
+        mirrorDestination: goneDir,
+        artifactFiles: ['mirror_000001.tar'],
+      });
+      await seedPersistedArtifact(storageDir, opId, 'mirror_000001.tar', 'survives-dest-removal');
+
+      const list = await request.get(`/api/operations/${opId}/artifacts`);
+      expect(list.status).toBe(200);
+      expect(list.body.artifacts).toHaveLength(1);
+
+      const dl = await request.get(
+        `/api/operations/${opId}/artifacts/mirror_000001.tar/download`,
+      );
+      expect(dl.status).toBe(200);
+      expect(dl.text).toBe('survives-dest-removal');
     });
 
     it('falls back to live directory scan for operations without artifactFiles', async () => {
@@ -251,6 +292,20 @@ describe('Artifact API', () => {
       expect(res.status).toBe(200);
       expect(res.body.artifacts).toHaveLength(1);
       expect(res.body.artifacts[0].filename).toBe('mirror_000001.tar');
+    });
+
+    it('removes persisted artifacts when the operation is deleted', async () => {
+      const opId = await seedOperation(storageDir, {
+        status: 'success',
+        artifactFiles: ['mirror_000001.tar'],
+      });
+      await seedPersistedArtifact(storageDir, opId, 'mirror_000001.tar', 'to-be-deleted');
+      const artifactPath = path.join(storageDir, 'artifacts', opId, 'mirror_000001.tar');
+      expect(fs.existsSync(artifactPath)).toBe(true);
+
+      const del = await request.delete(`/api/operations/${opId}`);
+      expect(del.status).toBe(200);
+      expect(fs.existsSync(path.join(storageDir, 'artifacts', opId))).toBe(false);
     });
   });
 

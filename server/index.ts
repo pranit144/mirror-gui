@@ -33,7 +33,12 @@ interface OperationRecord {
   name: string;
   configFile: string;
   mirrorDestination?: string;
-  /** Archive filenames recorded in the mirror destination at operation completion. */
+  /**
+   * Archive filenames produced by this operation.
+   * Contents are copied into ARTIFACTS_DIR/{id}/ at completion so later runs
+   * that overwrite mirror_000001.tar in the shared destination cannot replace
+   * this operation's downloadable bytes.
+   */
   artifactFiles?: string[];
   status: 'running' | 'success' | 'failed' | 'stopped';
   startedAt: string;
@@ -247,6 +252,8 @@ const STORAGE_DIR = process.env.STORAGE_DIR || './data';
 const CONFIGS_DIR = path.join(STORAGE_DIR, 'configs');
 const OPERATIONS_DIR = path.join(STORAGE_DIR, 'operations');
 const LOGS_DIR = path.join(STORAGE_DIR, 'logs');
+/** Per-operation copies of mirror archives — survives oc-mirror overwriting the shared destination. */
+const ARTIFACTS_DIR = path.join(STORAGE_DIR, 'artifacts');
 const CACHE_DIR = path.resolve(process.env.OC_MIRROR_CACHE_DIR || path.join(STORAGE_DIR, 'cache'));
 const APP_ROOT_DIR = process.env.OC_MIRROR_WORKDIR || path.resolve(__dirname, '..');
 const DEV_CACHE_DIR = path.join(APP_ROOT_DIR, '.local-run', 'vite');
@@ -285,6 +292,7 @@ async function ensureDirectories(): Promise<void> {
     CONFIGS_DIR,
     OPERATIONS_DIR,
     LOGS_DIR,
+    ARTIFACTS_DIR,
     CACHE_DIR,
     MIRROR_BASE_DIR,
     DEFAULT_MIRROR_DIR,
@@ -313,6 +321,7 @@ async function clearOperationHistory(): Promise<void> {
   if (!hasPersistedMirrors) {
     let clearedOps = 0;
     let clearedLogs = 0;
+    let clearedArtifacts = 0;
 
     try {
       const opFiles = await fsp.readdir(OPERATIONS_DIR);
@@ -348,8 +357,26 @@ async function clearOperationHistory(): Promise<void> {
       }
     }
 
-    if (clearedOps > 0 || clearedLogs > 0) {
-      console.log(`Cleared ${clearedOps} operation files and ${clearedLogs} log files on startup (fresh start detected)`);
+    try {
+      const artifactDirs = await fsp.readdir(ARTIFACTS_DIR);
+      for (const entry of artifactDirs) {
+        try {
+          await fsp.rm(path.join(ARTIFACTS_DIR, entry), { recursive: true, force: true });
+          clearedArtifacts++;
+        } catch (error: unknown) {
+          console.warn(`Failed to delete artifact store ${entry}:`, error);
+        }
+      }
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn('Error reading artifacts directory:', error);
+      }
+    }
+
+    if (clearedOps > 0 || clearedLogs > 0 || clearedArtifacts > 0) {
+      console.log(
+        `Cleared ${clearedOps} operation files, ${clearedLogs} log files, and ${clearedArtifacts} artifact stores on startup (fresh start detected)`,
+      );
     }
   } else {
     console.log('Persistent mirror files detected - keeping operation history');
@@ -518,22 +545,127 @@ interface MirrorArtifact {
   downloadUrl: string;
 }
 
+function operationArtifactsDir(operationId: string): string {
+  return path.join(ARTIFACTS_DIR, operationId);
+}
+
+/** True when path is a regular file (rejects symlinks). */
+async function isRegularFile(filePath: string): Promise<boolean> {
+  try {
+    const stats = await fsp.lstat(filePath);
+    return stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Copy archives from the shared mirror destination into per-operation storage.
+ * Uses a temp directory + rename so concurrent readers never see a partial copy.
+ * Must use a real copy (not hardlink): oc-mirror overwrites the destination file
+ * in place, which would mutate hardlinked "persisted" bytes.
+ */
+async function persistOperationArtifacts(
+  operationId: string,
+  mirrorDir: string,
+): Promise<string[]> {
+  const entries = await fsp.readdir(mirrorDir, { withFileTypes: true });
+  const archiveNames = entries
+    .filter((e) => e.isFile() && ARCHIVE_EXTENSION_PATTERN.test(e.name))
+    .map((e) => e.name)
+    .sort();
+
+  if (archiveNames.length === 0) {
+    return [];
+  }
+
+  const destDir = operationArtifactsDir(operationId);
+  const tmpDir = path.join(ARTIFACTS_DIR, `.${operationId}.tmp`);
+
+  await fsp.rm(tmpDir, { recursive: true, force: true });
+  await fsp.mkdir(tmpDir, { recursive: true });
+
+  try {
+    for (const name of archiveNames) {
+      const src = path.join(mirrorDir, name);
+      // Re-check each file: skip if deleted mid-copy or replaced by a symlink.
+      if (!(await isRegularFile(src))) {
+        continue;
+      }
+      await fsp.copyFile(src, path.join(tmpDir, name));
+    }
+
+    const copied = (await fsp.readdir(tmpDir)).filter((n) => ARCHIVE_EXTENSION_PATTERN.test(n)).sort();
+    if (copied.length === 0) {
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+      return [];
+    }
+
+    await fsp.rm(destDir, { recursive: true, force: true });
+    await fsp.rename(tmpDir, destDir);
+    return copied;
+  } catch (error) {
+    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function removePersistedArtifacts(operationId: string): Promise<void> {
+  await fsp.rm(operationArtifactsDir(operationId), { recursive: true, force: true });
+  await fsp.rm(path.join(ARTIFACTS_DIR, `.${operationId}.tmp`), { recursive: true, force: true });
+}
+
+/**
+ * Resolve the on-disk file for an archive download.
+ * Prefer the per-operation store; fall back to the live mirror destination for
+ * legacy records that completed before persistence was introduced.
+ * Once a persisted store directory exists for the operation, never fall back to
+ * the shared destination — that would mix generations after an overwrite.
+ */
+async function resolveArtifactFilePath(
+  operation: OperationRecord,
+  mirrorDir: string | null,
+  filename: string,
+): Promise<string | null> {
+  const persistedDir = operationArtifactsDir(operation.id);
+  let hasPersistedStore = false;
+  try {
+    const dirStats = await fsp.lstat(persistedDir);
+    hasPersistedStore = dirStats.isDirectory();
+  } catch {
+    hasPersistedStore = false;
+  }
+
+  if (hasPersistedStore) {
+    const persistedPath = path.join(persistedDir, filename);
+    return (await isRegularFile(persistedPath)) ? persistedPath : null;
+  }
+
+  // Legacy: only serve from the shared destination when no persisted store exists.
+  // If artifactFiles was recorded, require membership so we don't serve arbitrary
+  // files that appeared later under the same destination.
+  if (operation.artifactFiles && !operation.artifactFiles.includes(filename)) {
+    return null;
+  }
+
+  if (!mirrorDir) return null;
+  const livePath = path.join(mirrorDir, filename);
+  if (await isRegularFile(livePath)) {
+    return livePath;
+  }
+  return null;
+}
+
 /**
  * List archives for an operation.
  *
- * When the operation record includes `artifactFiles` (set at completion time),
- * we use that definitive list and only include files that still exist on disk.
- * This ensures each operation shows only the archives it produced, even when a
- * later operation targeting the same destination has overwritten the files.
- *
- * For older records without `artifactFiles`, we fall back to a live directory
- * scan and return every archive present.
- *
+ * Preferred source: per-operation copies under ARTIFACTS_DIR/{id}/.
+ * Fallback (legacy): live mirror destination, optionally scoped by artifactFiles.
  * Symlinks and non-regular files are always skipped.
  */
 async function scanOperationArtifacts(
   operation: OperationRecord,
-  mirrorDir: string,
+  mirrorDir: string | null,
 ): Promise<{ artifacts: MirrorArtifact[] }> {
   const artifacts: MirrorArtifact[] = [];
 
@@ -541,34 +673,40 @@ async function scanOperationArtifacts(
     `/api/operations/${encodeURIComponent(operation.id)}` +
     `/artifacts/${encodeURIComponent(filename)}/download`;
 
-  if (operation.artifactFiles) {
-    // Use the recorded list — only include files that still exist on disk.
-    for (const filename of operation.artifactFiles) {
-      if (!ARCHIVE_EXTENSION_PATTERN.test(filename)) continue;
-      const filePath = path.join(mirrorDir, filename);
-      let stats: fs.Stats;
-      try {
-        stats = await fsp.lstat(filePath);
-      } catch {
-        continue; // file was overwritten or deleted by a later operation
+  const pushFromDir = async (dir: string, allowedNames: string[] | null) => {
+    if (allowedNames) {
+      for (const filename of allowedNames) {
+        if (!ARCHIVE_EXTENSION_PATTERN.test(filename)) continue;
+        const filePath = path.join(dir, filename);
+        let stats: fs.Stats;
+        try {
+          stats = await fsp.lstat(filePath);
+        } catch {
+          continue;
+        }
+        if (!stats.isFile()) continue;
+        artifacts.push({
+          filename,
+          sizeBytes: stats.size,
+          lastModified: stats.mtime.toISOString(),
+          downloadUrl: makeDownloadUrl(filename),
+        });
       }
-      if (!stats.isFile()) continue;
-      artifacts.push({
-        filename,
-        sizeBytes: stats.size,
-        lastModified: stats.mtime.toISOString(),
-        downloadUrl: makeDownloadUrl(filename),
-      });
+      return;
     }
-  } else {
-    // Legacy path: no recorded list, scan the directory.
-    const entries = await fsp.readdir(mirrorDir, { withFileTypes: true });
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const entry of entries) {
       if (!entry.isFile()) continue;
       if (!ARCHIVE_EXTENSION_PATTERN.test(entry.name)) continue;
       let stats: fs.Stats;
       try {
-        stats = await fsp.lstat(path.join(mirrorDir, entry.name));
+        stats = await fsp.lstat(path.join(dir, entry.name));
       } catch {
         continue;
       }
@@ -580,19 +718,42 @@ async function scanOperationArtifacts(
         downloadUrl: makeDownloadUrl(entry.name),
       });
     }
+  };
+
+  const persistedDir = operationArtifactsDir(operation.id);
+  let hasPersisted = false;
+  try {
+    const persistedEntries = await fsp.readdir(persistedDir);
+    hasPersisted = persistedEntries.some((n) => ARCHIVE_EXTENSION_PATTERN.test(n));
+  } catch {
+    hasPersisted = false;
+  }
+
+  if (hasPersisted) {
+    // Definitive per-operation copies — ignore whatever now sits in the shared dest.
+    await pushFromDir(persistedDir, operation.artifactFiles ?? null);
+  } else if (mirrorDir) {
+    // Legacy records (or persistence failed): best-effort live scan.
+    await pushFromDir(mirrorDir, operation.artifactFiles ?? null);
   }
 
   artifacts.sort((a, b) => a.filename.localeCompare(b.filename));
   return { artifacts };
 }
 
-/** Shared precondition check used by both artifact endpoints. */
+type ArtifactContextResult =
+  | { ok: true; operation: OperationRecord; mirrorDir: string | null }
+  | { ok: false; status: number; body: Record<string, unknown> };
+
+/**
+ * Shared precondition for artifact list/download.
+ * Mirror destination is optional when per-operation archives already exist —
+ * so downloads survive deletion/relocation of the shared working tree.
+ */
 async function resolveArtifactContext(
   operationId: string,
-): Promise<
-  | { ok: true; operation: OperationRecord; mirrorDir: string }
-  | { ok: false; status: number; body: Record<string, unknown> }
-> {
+  options: { requireMirrorDir?: boolean } = {},
+): Promise<ArtifactContextResult> {
   let operation: OperationRecord;
   try {
     operation = await getOperation(operationId);
@@ -614,37 +775,67 @@ async function resolveArtifactContext(
     };
   }
 
-  if (!operation.mirrorDestination) {
-    return {
-      ok: false,
-      status: 404,
-      body: { error: 'Operation has no mirror destination recorded' },
-    };
+  let mirrorDir: string | null = null;
+  if (operation.mirrorDestination) {
+    const resolved = path.resolve(operation.mirrorDestination);
+    try {
+      const dirStats = await fsp.lstat(resolved);
+      if (dirStats.isDirectory()) {
+        mirrorDir = resolved;
+      }
+    } catch {
+      // Destination may have been removed; persisted artifacts can still serve.
+    }
   }
 
-  const mirrorDir = path.resolve(operation.mirrorDestination);
-
-  let dirStats: fs.Stats;
-  try {
-    dirStats = await fsp.lstat(mirrorDir);
-  } catch {
-    return {
-      ok: false,
-      status: 404,
-      body: {
-        error: 'Mirror destination directory not found',
-        path: mirrorDir,
-        hostPath: toHostPath(mirrorDir),
-      },
-    };
-  }
-
-  if (!dirStats.isDirectory()) {
-    return {
-      ok: false,
-      status: 404,
-      body: { error: 'Mirror destination is not a directory' },
-    };
+  if (options.requireMirrorDir) {
+    if (!operation.mirrorDestination) {
+      return {
+        ok: false,
+        status: 404,
+        body: { error: 'Operation has no mirror destination recorded' },
+      };
+    }
+    if (!mirrorDir) {
+      const missingPath = path.resolve(operation.mirrorDestination);
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: 'Mirror destination directory not found',
+          path: missingPath,
+          hostPath: toHostPath(missingPath),
+        },
+      };
+    }
+  } else if (!mirrorDir) {
+    // Allow access when persisted archives exist even without a live destination.
+    let hasPersisted = false;
+    try {
+      const entries = await fsp.readdir(operationArtifactsDir(operation.id));
+      hasPersisted = entries.some((n) => ARCHIVE_EXTENSION_PATTERN.test(n));
+    } catch {
+      hasPersisted = false;
+    }
+    if (!hasPersisted) {
+      if (!operation.mirrorDestination) {
+        return {
+          ok: false,
+          status: 404,
+          body: { error: 'Operation has no mirror destination recorded' },
+        };
+      }
+      const missingPath = path.resolve(operation.mirrorDestination);
+      return {
+        ok: false,
+        status: 404,
+        body: {
+          error: 'Mirror destination directory not found',
+          path: missingPath,
+          hostPath: toHostPath(missingPath),
+        },
+      };
+    }
   }
 
   return { ok: true, operation, mirrorDir };
@@ -1968,23 +2159,33 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
         }
       }
 
-      // Snapshot the archive filenames that exist in the mirror destination
-      // right now, while the operation has just finished. Storing them in the
-      // record means each operation's artifact listing is scoped to exactly
-      // what it produced, even if a later operation targeting the same
-      // destination overwrites those files (oc-mirror resets mirror_000001.tar
-      // on every run to the same location).
+      // Copy archives into per-operation storage before marking success.
+      // oc-mirror reuses filenames (mirror_000001.tar) in the shared destination;
+      // filename snapshots alone do not preserve bytes across subsequent runs.
       let artifactFiles: string[] | undefined;
       if (finalStatus === 'success' && operation.mirrorDestination) {
         try {
-          const entries = await fsp.readdir(operation.mirrorDestination, { withFileTypes: true });
-          const found = entries
-            .filter(e => e.isFile() && ARCHIVE_EXTENSION_PATTERN.test(e.name))
-            .map(e => e.name)
-            .sort();
-          if (found.length > 0) artifactFiles = found;
-        } catch {
-          // mirror destination may not exist yet (e.g. dry-run) — skip
+          const copied = await persistOperationArtifacts(operationId, operation.mirrorDestination);
+          if (copied.length > 0) {
+            artifactFiles = copied;
+          }
+        } catch (persistError: unknown) {
+          console.error(
+            `Failed to persist archives for operation ${operationId}:`,
+            persistError,
+          );
+          // Fall back to recording filenames from the live destination so the
+          // operation is still usable until a later run overwrites them.
+          try {
+            const entries = await fsp.readdir(operation.mirrorDestination, { withFileTypes: true });
+            const found = entries
+              .filter((e) => e.isFile() && ARCHIVE_EXTENSION_PATTERN.test(e.name))
+              .map((e) => e.name)
+              .sort();
+            if (found.length > 0) artifactFiles = found;
+          } catch {
+            // mirror destination may not exist (e.g. dry-run) — skip
+          }
         }
       }
 
@@ -2070,6 +2271,16 @@ app.delete('/api/operations/:id', async (req: Request, res: Response) => {
       await fsp.unlink(filepath);
     } catch { /* file may already be deleted */ }
 
+    try {
+      await fsp.unlink(path.join(LOGS_DIR, `${id}.log`));
+    } catch { /* log may already be deleted */ }
+
+    try {
+      await removePersistedArtifacts(id);
+    } catch (error: unknown) {
+      console.warn(`Failed to remove persisted artifacts for ${id}:`, error);
+    }
+
     res.json({ message: 'Operation deleted successfully' });
   } catch {
     res.status(500).json({ error: 'Failed to delete operation' });
@@ -2086,10 +2297,15 @@ app.get('/api/operations/:id/artifacts', async (req: Request, res: Response) => 
       context.mirrorDir,
     );
 
+    const mirrorDestination = context.mirrorDir
+      ?? (context.operation.mirrorDestination
+        ? path.resolve(context.operation.mirrorDestination)
+        : null);
+
     res.json({
       artifacts,
-      mirrorDestination: context.mirrorDir,
-      hostMirrorDestination: toHostPath(context.mirrorDir),
+      mirrorDestination,
+      hostMirrorDestination: mirrorDestination ? toHostPath(mirrorDestination) : null,
     });
   } catch (error: unknown) {
     console.error('Error listing operation artifacts:', error);
@@ -2116,15 +2332,29 @@ app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request,
       return res.status(400).json({ error: 'Invalid archive filename' });
     }
 
-    const filepath = path.resolve(context.mirrorDir, basename);
-    if (!filepath.startsWith(context.mirrorDir + path.sep)) {
+    const filepath = await resolveArtifactFilePath(
+      context.operation,
+      context.mirrorDir,
+      basename,
+    );
+    if (!filepath) {
+      return res.status(404).json({ error: 'Archive not found' });
+    }
+
+    // Defense in depth: path must stay under ARTIFACTS_DIR or the mirror dir.
+    const resolvedFile = path.resolve(filepath);
+    const persistedRoot = path.resolve(operationArtifactsDir(context.operation.id));
+    const underPersisted = resolvedFile.startsWith(persistedRoot + path.sep);
+    const underMirror = context.mirrorDir
+      ? resolvedFile.startsWith(context.mirrorDir + path.sep)
+      : false;
+    if (!underPersisted && !underMirror) {
       return res.status(400).json({ error: 'Invalid archive filename' });
     }
 
-    // lstat does not follow symlinks — a symlink to /etc/passwd is not a regular file.
     let stats: fs.Stats;
     try {
-      stats = await fsp.lstat(filepath);
+      stats = await fsp.lstat(resolvedFile);
     } catch {
       return res.status(404).json({ error: 'Archive not found' });
     }
@@ -2142,7 +2372,7 @@ app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request,
     // multi-GB tar, burning CPU and invalidating Content-Length. no-transform opts out.
     res.setHeader('Cache-Control', 'no-transform');
 
-    res.sendFile(filepath);
+    res.sendFile(resolvedFile);
   } catch (error: unknown) {
     console.error('Error downloading operation artifact:', error);
     res.status(500).json({ error: 'Failed to download archive' });
@@ -2151,8 +2381,12 @@ app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request,
 
 app.get('/api/operations/:id/working-dir', async (req: Request, res: Response) => {
   try {
-    const context = await resolveArtifactContext(req.params.id);
+    const context = await resolveArtifactContext(req.params.id, { requireMirrorDir: true });
     if (!context.ok) return res.status(context.status).json(context.body);
+    // requireMirrorDir guarantees a live destination directory.
+    if (!context.mirrorDir) {
+      return res.status(404).json({ error: 'Mirror destination directory not found' });
+    }
 
     const workingDir = path.join(context.mirrorDir, 'working-dir');
 
@@ -2855,6 +3089,7 @@ function logStartup(): void {
   console.log(`Storage directory: ${STORAGE_DIR}`);
   console.log(`Configs directory: ${CONFIGS_DIR}`);
   console.log(`Operations directory: ${OPERATIONS_DIR}`);
+  console.log(`Artifacts directory: ${ARTIFACTS_DIR}`);
   console.log(`Logs directory: ${LOGS_DIR}`);
   console.log(`Cache directory: ${CACHE_DIR}`);
   console.log(`App root directory: ${APP_ROOT_DIR}`);
