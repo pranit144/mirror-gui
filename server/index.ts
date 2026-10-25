@@ -509,27 +509,6 @@ function toHostPath(containerPath: string): string {
   return resolved.replace(containerDataDir, hostDataDir);
 }
 
-/**
- * A mirror destination is shared across operations that target the same
- * subdirectory. We associate archives with a specific run by comparing each
- * file's mtime against the operation's startedAt/completedAt window.
- * The tolerance covers filesystem timestamp granularity and the small gap
- * between oc-mirror exiting and completedAt being stamped.
- */
-const ARTIFACT_MTIME_TOLERANCE_MS = 5000;
-
-function isArchiveOfRun(mtimeMs: number, operation: OperationRecord): boolean {
-  const startedMs = new Date(operation.startedAt).getTime();
-  const completedMs = operation.completedAt
-    ? new Date(operation.completedAt).getTime()
-    : Date.now();
-  if (Number.isNaN(startedMs) || Number.isNaN(completedMs)) return false;
-  return (
-    mtimeMs >= startedMs - ARTIFACT_MTIME_TOLERANCE_MS &&
-    mtimeMs <= completedMs + ARTIFACT_MTIME_TOLERANCE_MS
-  );
-}
-
 interface MirrorArtifact {
   filename: string;
   sizeBytes: number;
@@ -538,18 +517,21 @@ interface MirrorArtifact {
 }
 
 /**
- * Read the mirror destination directory and split archives into those that
- * belong to this operation's run window and those that don't.
- * Symlinks and non-regular files are ignored — entry.isFile() already returns
- * false for symlinks, and we re-check with lstat before trusting the result.
+ * List all archives in the operation's mirror destination directory.
+ * Symlinks and non-regular files are skipped — entry.isFile() returns false
+ * for symlinks, and we re-check with lstat to close the TOCTOU gap.
+ * We intentionally do not filter by mtime: oc-mirror writes archives
+ * incrementally and can update timestamps in ways that make time-window
+ * filtering unreliable. The destination path itself (stored in the operation
+ * record) is already the scope — every archive in it belongs to runs that
+ * targeted this location.
  */
 async function scanOperationArtifacts(
   operation: OperationRecord,
   mirrorDir: string,
-): Promise<{ artifacts: MirrorArtifact[]; otherRunArchiveCount: number }> {
+): Promise<{ artifacts: MirrorArtifact[] }> {
   const entries = await fsp.readdir(mirrorDir, { withFileTypes: true });
   const artifacts: MirrorArtifact[] = [];
-  let otherRunArchiveCount = 0;
 
   for (const entry of entries) {
     if (!entry.isFile()) continue;
@@ -561,12 +543,7 @@ async function scanOperationArtifacts(
     } catch {
       continue; // raced deletion — skip rather than fail the entire listing
     }
-    if (!stats.isFile()) continue; // closed TOCTOU for symlinks
-
-    if (!isArchiveOfRun(stats.mtimeMs, operation)) {
-      otherRunArchiveCount += 1;
-      continue;
-    }
+    if (!stats.isFile()) continue; // lstat re-check: symlinks are not regular files
 
     artifacts.push({
       filename: entry.name,
@@ -579,7 +556,7 @@ async function scanOperationArtifacts(
   }
 
   artifacts.sort((a, b) => a.filename.localeCompare(b.filename));
-  return { artifacts, otherRunArchiveCount };
+  return { artifacts };
 }
 
 /** Shared precondition check used by both artifact endpoints. */
@@ -2107,11 +2084,6 @@ app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request,
       return res.status(404).json({ error: 'Archive not found' });
     }
 
-    // Only serve archives that this operation produced.
-    if (!isArchiveOfRun(stats.mtimeMs, context.operation)) {
-      return res.status(404).json({ error: 'Archive was not produced by this operation' });
-    }
-
     res.setHeader('Content-Disposition', `attachment; filename="${basename}"`);
     res.setHeader(
       'Content-Type',
@@ -2126,6 +2098,101 @@ app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request,
   } catch (error: unknown) {
     console.error('Error downloading operation artifact:', error);
     res.status(500).json({ error: 'Failed to download archive' });
+  }
+});
+
+app.get('/api/operations/:id/working-dir', async (req: Request, res: Response) => {
+  try {
+    const context = await resolveArtifactContext(req.params.id);
+    if (!context.ok) return res.status(context.status).json(context.body);
+
+    const workingDir = path.join(context.mirrorDir, 'working-dir');
+
+    // Confirm working-dir exists and is a real directory (not a symlink).
+    try {
+      const wdStats = await fsp.lstat(workingDir);
+      if (!wdStats.isDirectory()) {
+        return res.status(404).json({ error: 'working-dir is not a directory' });
+      }
+    } catch {
+      return res.status(404).json({
+        error: 'working-dir not found — the mirror may not have produced one yet',
+        path: workingDir,
+        hostPath: toHostPath(workingDir),
+      });
+    }
+
+    // Optional relative subpath within working-dir, used for lazy tree expansion.
+    const rawSubpath = (req.query.path as string | undefined) || '';
+    let targetDir = workingDir;
+
+    if (rawSubpath) {
+      // Prevent traversal: resolve must stay inside workingDir.
+      const resolved = path.resolve(workingDir, rawSubpath);
+      if (resolved !== workingDir && !resolved.startsWith(workingDir + path.sep)) {
+        return res.status(400).json({ error: 'Invalid path' });
+      }
+      try {
+        const subStats = await fsp.lstat(resolved);
+        if (!subStats.isDirectory()) {
+          return res.status(400).json({ error: 'Path is not a directory' });
+        }
+      } catch {
+        return res.status(404).json({ error: 'Path not found' });
+      }
+      targetDir = resolved;
+    }
+
+    const entries = await fsp.readdir(targetDir, { withFileTypes: true });
+    const items: {
+      name: string;
+      path: string;
+      type: 'file' | 'directory';
+      sizeBytes?: number;
+      hasChildren: boolean;
+    }[] = [];
+
+    for (const entry of entries) {
+      // Skip symlinks entirely — they could point anywhere on the filesystem.
+      if (entry.isSymbolicLink()) continue;
+
+      if (entry.isDirectory()) {
+        const childPath = rawSubpath ? `${rawSubpath}/${entry.name}` : entry.name;
+        // Check whether the directory has any children to decide if it's expandable.
+        let hasChildren = false;
+        try {
+          const children = await fsp.readdir(path.join(targetDir, entry.name));
+          hasChildren = children.length > 0;
+        } catch { /* unreadable — treat as empty */ }
+
+        items.push({ name: entry.name, path: childPath, type: 'directory', hasChildren });
+      } else if (entry.isFile()) {
+        const filePath = rawSubpath ? `${rawSubpath}/${entry.name}` : entry.name;
+        let sizeBytes: number | undefined;
+        try {
+          const fileStats = await fsp.lstat(path.join(targetDir, entry.name));
+          sizeBytes = fileStats.size;
+        } catch { /* skip */ }
+        items.push({ name: entry.name, path: filePath, type: 'file', sizeBytes, hasChildren: false });
+      }
+      // Other types (devices, sockets, etc.) are silently ignored.
+    }
+
+    // Directories first, then files; alphabetical within each group.
+    items.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    res.json({
+      items,
+      workingDirPath: workingDir,
+      hostWorkingDirPath: toHostPath(workingDir),
+      currentPath: rawSubpath,
+    });
+  } catch (error: unknown) {
+    console.error('Error listing working-dir:', error);
+    res.status(500).json({ error: 'Failed to list working-dir contents' });
   }
 });
 

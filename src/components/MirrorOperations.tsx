@@ -44,6 +44,8 @@ import {
   ExpandableSectionToggle,
   Switch,
   NumberInput,
+  TreeView,
+  type TreeViewDataItem,
 } from '@patternfly/react-core';
 import {
   SyncAltIcon,
@@ -62,6 +64,9 @@ import {
   TrashAltIcon,
   SearchIcon,
   DownloadIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  FileIcon,
 } from '@patternfly/react-icons';
 import { Table, Thead, Tbody, Tr, Th, Td } from '@patternfly/react-table';
 import { useAlerts } from '../AlertContext';
@@ -110,6 +115,25 @@ interface MirrorArtifact {
 
 interface ArtifactListing {
   artifacts: MirrorArtifact[];
+  error?: string;
+}
+
+interface WorkingDirItem {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  sizeBytes?: number;
+  hasChildren: boolean;
+}
+
+interface WorkingDirState {
+  /** Items fetched per directory path ('root' key = top level). */
+  fetched: Record<string, WorkingDirItem[]>;
+  /** Directory paths currently being fetched. */
+  loadingPaths: Set<string>;
+  workingDirPath?: string;
+  hostWorkingDirPath?: string;
+  /** Top-level error (e.g. working-dir missing). */
   error?: string;
 }
 
@@ -337,6 +361,9 @@ const MirrorOperations: React.FC = () => {
   const [kebabOpen, setKebabOpen] = useState<Record<string, boolean>>({});
   const [artifacts, setArtifacts] = useState<Record<string, ArtifactListing | undefined>>({});
   const [artifactsLoading, setArtifactsLoading] = useState<Record<string, boolean>>({});
+  const [workingDirs, setWorkingDirs] = useState<Record<string, WorkingDirState>>({});
+  const [showWorkingDir, setShowWorkingDir] = useState(false);
+  const [workingDirOpId, setWorkingDirOpId] = useState<string | null>(null);
   const [hostDataDir, setHostDataDir] = useState('');
   const [now, setNow] = useState(Date.now());
 
@@ -487,6 +514,61 @@ const MirrorOperations: React.FC = () => {
       }));
     } finally {
       setArtifactsLoading(prev => ({ ...prev, [operationId]: false }));
+    }
+  }, []);
+
+  /**
+   * Fetch one level of the working-dir tree for a given operation and subpath.
+   * 'root' is the sentinel key for the top-level directory.
+   * Called both for the initial load and on each directory expansion.
+   */
+  const fetchWorkingDirPath = useCallback(async (operationId: string, subpath: string) => {
+    const key = subpath || 'root';
+
+    setWorkingDirs(prev => {
+      const current = prev[operationId] ?? { fetched: {}, loadingPaths: new Set() };
+      const newLoadingPaths = new Set(current.loadingPaths);
+      newLoadingPaths.add(key);
+      return { ...prev, [operationId]: { ...current, loadingPaths: newLoadingPaths } };
+    });
+
+    try {
+      const url = subpath
+        ? `/api/operations/${operationId}/working-dir?path=${encodeURIComponent(subpath)}`
+        : `/api/operations/${operationId}/working-dir`;
+
+      const response = await axios.get<{
+        items: WorkingDirItem[];
+        workingDirPath: string;
+        hostWorkingDirPath: string;
+        currentPath: string;
+      }>(url);
+
+      setWorkingDirs(prev => {
+        const current = prev[operationId] ?? { fetched: {}, loadingPaths: new Set() };
+        const newLoadingPaths = new Set(current.loadingPaths);
+        newLoadingPaths.delete(key);
+        return {
+          ...prev,
+          [operationId]: {
+            ...current,
+            fetched: { ...current.fetched, [key]: response.data.items },
+            loadingPaths: newLoadingPaths,
+            workingDirPath: response.data.workingDirPath,
+            hostWorkingDirPath: response.data.hostWorkingDirPath,
+          },
+        };
+      });
+    } catch (error: unknown) {
+      const err = error as { response?: { data?: { error?: string } }; message?: string };
+      const msg = err.response?.data?.error || err.message || 'Failed to load working-dir';
+      console.error('Error fetching working-dir:', error);
+      setWorkingDirs(prev => {
+        const current = prev[operationId] ?? { fetched: {}, loadingPaths: new Set() };
+        const newLoadingPaths = new Set(current.loadingPaths);
+        newLoadingPaths.delete(key);
+        return { ...prev, [operationId]: { ...current, loadingPaths: newLoadingPaths, error: msg } };
+      });
     }
   }, []);
 
@@ -736,6 +818,60 @@ const MirrorOperations: React.FC = () => {
     const i = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
     return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
   };
+
+  /**
+   * Recursively build PatternFly TreeViewDataItem[] from the flat fetched map.
+   * Directories that haven't been expanded yet get a placeholder child so PF
+   * renders an expand arrow for them.
+   */
+  const buildWorkingDirTree = (
+    items: WorkingDirItem[],
+    wdState: WorkingDirState,
+  ): TreeViewDataItem[] =>
+    items.map(item => {
+      const key = item.path || 'root';
+      const isLoading = wdState.loadingPaths.has(key);
+      const fetchedChildren = wdState.fetched[key];
+
+      let children: TreeViewDataItem[] | undefined;
+      if (item.type === 'directory') {
+        if (isLoading) {
+          children = [{ id: `${key}-loading`, name: <span><Spinner size="sm" /> Loading…</span> }];
+        } else if (fetchedChildren) {
+          children = fetchedChildren.length > 0
+            ? buildWorkingDirTree(fetchedChildren, wdState)
+            : [{ id: `${key}-empty`, name: <span style={{ color: 'var(--pf-t--global--text--color--subtle)' }}>Empty directory</span> }];
+        } else if (item.hasChildren) {
+          // Not yet fetched — placeholder so PF renders an expand arrow.
+          children = [{ id: `${key}-placeholder`, name: '' }];
+        } else {
+          children = [];
+        }
+      }
+
+      const label = (
+        <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+          <FlexItem>
+            {item.type === 'directory' ? <FolderIcon /> : <FileIcon />}
+          </FlexItem>
+          <FlexItem>{item.name}</FlexItem>
+          {item.sizeBytes !== undefined && (
+            <FlexItem>
+              <span style={{ color: 'var(--pf-t--global--text--color--subtle)', fontSize: '0.85em' }}>
+                {formatBytes(item.sizeBytes)}
+              </span>
+            </FlexItem>
+          )}
+        </Flex>
+      );
+
+      return {
+        id: key,
+        name: label,
+        children,
+        expandedIcon: item.type === 'directory' ? <FolderOpenIcon /> : undefined,
+      } as TreeViewDataItem;
+    });
 
   const scrollToOperations = () => {
     document.getElementById('operation-history-card')?.scrollIntoView({ behavior: 'smooth' });
@@ -1493,13 +1629,15 @@ const MirrorOperations: React.FC = () => {
                               );
                             }
                             // Archives confirmed — show one download item per archive.
-                            return listing.artifacts.map((artifact, index) => {
+                            return listing.artifacts.map((artifact) => {
+                              // Single archive: saved as "Mirror Operation abc12345.tar".
+                              // Multiple archives: include the original sequence name so the
+                              // user can tell them apart, e.g.
+                              // "Mirror Operation abc12345 - mirror_seq1_000000.tar".
                               const downloadName =
                                 listing.artifacts.length === 1
                                   ? `${op.name}.tar`
-                                  : index === 0
-                                    ? `${op.name}.tar`
-                                    : `${op.name}-${index + 1}.tar`;
+                                  : `${op.name} - ${artifact.filename}`;
 
                               return (
                                 <DropdownItem
@@ -1512,11 +1650,31 @@ const MirrorOperations: React.FC = () => {
                                 >
                                   {listing.artifacts.length === 1
                                     ? `Download archive (${formatBytes(artifact.sizeBytes)})`
-                                    : `Download archive ${index + 1} (${formatBytes(artifact.sizeBytes)})`}
+                                    : `${artifact.filename} (${formatBytes(artifact.sizeBytes)})`}
                                 </DropdownItem>
                               );
                             });
                           })()}
+                          {op.status === 'success' && op.mirrorDestination && (
+                            <DropdownItem
+                              key={`${op.id}-working-dir`}
+                              icon={<FolderIcon />}
+                              onClick={() => {
+                                setKebabOpen((prev) => ({ ...prev, [op.id]: false }));
+                                setWorkingDirOpId(op.id);
+                                setShowWorkingDir(true);
+                                // Fetch root level if not already fetched.
+                                if (!workingDirs[op.id]?.fetched['root']) {
+                                  void fetchWorkingDirPath(op.id, '');
+                                }
+                                setTimeout(() => {
+                                  document.getElementById('operation-working-dir-card')?.scrollIntoView({ behavior: 'smooth' });
+                                }, 100);
+                              }}
+                            >
+                              View Working Dir
+                            </DropdownItem>
+                          )}
                           <Divider key={`${op.id}-div`} component="li" />
                           {op.status === 'running' && (
                             <DropdownItem
@@ -1580,6 +1738,88 @@ const MirrorOperations: React.FC = () => {
           </CardBody>
         </Card>
       )}
+
+      {showWorkingDir && workingDirOpId && (() => {
+        const wdState = workingDirs[workingDirOpId];
+        const rootItems = wdState?.fetched['root'];
+        const isRootLoading = !wdState || wdState.loadingPaths.has('root');
+        const hostPath = wdState?.hostWorkingDirPath ?? wdState?.workingDirPath ?? '';
+
+        return (
+          <Card className="pf-v6-u-mt-lg" id="operation-working-dir-card">
+            <CardHeader>
+              <Flex justifyContent={{ default: 'justifyContentSpaceBetween' }} alignItems={{ default: 'alignItemsCenter' }}>
+                <FlexItem>
+                  <CardTitle>
+                    <Title headingLevel="h4">Working Directory</Title>
+                  </CardTitle>
+                </FlexItem>
+                <FlexItem>
+                  <Button variant="secondary" icon={<AngleUpIcon />} onClick={scrollToOperations}>
+                    Back to Top
+                  </Button>
+                </FlexItem>
+              </Flex>
+            </CardHeader>
+            <CardBody>
+              {wdState?.error ? (
+                <Alert variant="warning" isInline title={wdState.error} />
+              ) : (
+                <>
+                  {hostPath && (
+                    <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }} className="pf-v6-u-mb-md">
+                      <FlexItem>
+                        <span style={{ fontFamily: 'monospace', fontSize: '0.9em', color: 'var(--pf-t--global--text--color--subtle)' }}>
+                          {hostPath}
+                        </span>
+                      </FlexItem>
+                      <FlexItem>
+                        <Tooltip content="Copy working-dir path">
+                          <Button
+                            variant="plain"
+                            aria-label="Copy working-dir path"
+                            icon={<CopyIcon />}
+                            onClick={() => void copyMirrorPath(wdState?.workingDirPath ?? '')}
+                          />
+                        </Tooltip>
+                      </FlexItem>
+                    </Flex>
+                  )}
+                  {isRootLoading ? (
+                    <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+                      <FlexItem><Spinner size="md" aria-label="Loading working-dir" /></FlexItem>
+                      <FlexItem>Loading directory structure…</FlexItem>
+                    </Flex>
+                  ) : rootItems && rootItems.length > 0 ? (
+                    <div style={{ maxHeight: '500px', overflow: 'auto' }}>
+                      <TreeView
+                        data={buildWorkingDirTree(rootItems, wdState!)}
+                        hasGuides
+                        onExpand={(_evt, item) => {
+                          const itemPath = item.id as string;
+                          // Only fetch if we have a path, haven't fetched it yet,
+                          // and it's not already in flight.
+                          if (
+                            itemPath &&
+                            !wdState?.fetched[itemPath] &&
+                            !wdState?.loadingPaths.has(itemPath)
+                          ) {
+                            void fetchWorkingDirPath(workingDirOpId, itemPath);
+                          }
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <span style={{ color: 'var(--pf-t--global--text--color--subtle)' }}>
+                      working-dir is empty.
+                    </span>
+                  )}
+                </>
+              )}
+            </CardBody>
+          </Card>
+        );
+      })()}
 
       <Modal
         variant={ModalVariant.small}
