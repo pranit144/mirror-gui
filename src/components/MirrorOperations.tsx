@@ -85,6 +85,8 @@ interface Operation {
   completedAt?: string;
   duration?: number;
   mirrorDestination?: string;
+  /** Filenames copied into data/artifacts/{id}/ at success (e.g. mirror_000001.tar). */
+  artifactFiles?: string[];
   errorMessage?: string;
 }
 
@@ -399,6 +401,41 @@ const MirrorOperations: React.FC = () => {
     }
   }, []);
 
+  const fetchArtifacts = useCallback(async (operationId: string) => {
+    setArtifactsLoading(prev => ({ ...prev, [operationId]: true }));
+    try {
+      const response = await axios.get<ArtifactListing>(
+        `/api/operations/${operationId}/artifacts`,
+        { timeout: 15_000 },
+      );
+      const data = response.data;
+      // Guard against SPA/HTML fallback responses that are 200 but not JSON listings.
+      if (!data || !Array.isArray(data.artifacts)) {
+        setArtifacts(prev => ({
+          ...prev,
+          [operationId]: {
+            artifacts: [],
+            error: 'Invalid archive listing response',
+          },
+        }));
+        return;
+      }
+      setArtifacts(prev => ({ ...prev, [operationId]: data }));
+    } catch (error: unknown) {
+      const err = error as { response?: { data?: { error?: string } }; message?: string; code?: string };
+      console.error('Error fetching artifacts:', error);
+      setArtifacts(prev => ({
+        ...prev,
+        [operationId]: {
+          artifacts: [],
+          error: err.response?.data?.error || err.message || 'Failed to load archives',
+        },
+      }));
+    } finally {
+      setArtifactsLoading(prev => ({ ...prev, [operationId]: false }));
+    }
+  }, []);
+
   const handleOperationCompleted = useCallback((op: Operation) => {
     if (!op?.id) return;
 
@@ -412,13 +449,17 @@ const MirrorOperations: React.FC = () => {
 
       if (op.status === 'success') {
         addSuccessAlert('Mirror Operation Completed!');
+        // Warm the archive listing so the kebab does not start from a blank state.
+        if (op.mirrorDestination) {
+          void fetchArtifacts(op.id);
+        }
       } else if (op.status === 'failed') {
         addDangerAlert('Mirror Operation Failed');
       } else if (op.status === 'stopped') {
         addWarningAlert('Mirror Operation Stopped');
       }
     }
-  }, [addSuccessAlert, addDangerAlert, addWarningAlert, fetchLogs]);
+  }, [addSuccessAlert, addDangerAlert, addWarningAlert, fetchLogs, fetchArtifacts]);
 
   const startLogStream = useCallback((operationId: string) => {
     if (logStream) {
@@ -496,26 +537,6 @@ const MirrorOperations: React.FC = () => {
     setNewFolderName('');
     setFolderSelectOpen(false);
   }, [fetchFolders, addSuccessAlert, addDangerAlert]);
-
-  const fetchArtifacts = useCallback(async (operationId: string) => {
-    setArtifactsLoading(prev => ({ ...prev, [operationId]: true }));
-    try {
-      const response = await axios.get<ArtifactListing>(`/api/operations/${operationId}/artifacts`);
-      setArtifacts(prev => ({ ...prev, [operationId]: response.data }));
-    } catch (error: unknown) {
-      const err = error as { response?: { data?: { error?: string } }; message?: string };
-      console.error('Error fetching artifacts:', error);
-      setArtifacts(prev => ({
-        ...prev,
-        [operationId]: {
-          artifacts: [],
-          error: err.response?.data?.error || err.message || 'Failed to load archives',
-        },
-      }));
-    } finally {
-      setArtifactsLoading(prev => ({ ...prev, [operationId]: false }));
-    }
-  }, []);
 
   /**
    * Fetch one level of the working-dir tree for a given operation and subpath.
@@ -626,6 +647,25 @@ const MirrorOperations: React.FC = () => {
   useEffect(() => {
     operationsRef.current = operations;
   }, [operations]);
+
+  // Fetch archive listings when a kebab opens. Do not rely only on Dropdown
+  // onOpenChange — PatternFly may open via MenuToggle onClick without that
+  // callback, which previously left the menu stuck on "Loading archives…".
+  const prevKebabOpenRef = useRef<Record<string, boolean>>({});
+  useEffect(() => {
+    const prev = prevKebabOpenRef.current;
+    for (const [id, open] of Object.entries(kebabOpen)) {
+      if (!open || prev[id]) continue;
+      const op = operations.find((o) => o.id === id);
+      if (!op || op.status !== 'success' || !op.mirrorDestination) continue;
+      if (artifactsLoading[id]) continue;
+      const listing = artifacts[id];
+      if (!listing || listing.error) {
+        void fetchArtifacts(id);
+      }
+    }
+    prevKebabOpenRef.current = { ...kebabOpen };
+  }, [kebabOpen, operations, artifacts, artifactsLoading, fetchArtifacts]);
 
   useEffect(() => {
     if (runningOperation) {
@@ -1567,16 +1607,6 @@ const MirrorOperations: React.FC = () => {
                         isOpen={!!kebabOpen[op.id]}
                         onOpenChange={(open) => {
                           setKebabOpen((prev) => ({ ...prev, [op.id]: open }));
-                          // Fetch when opening: skip while in flight. Cache successful
-                          // listings for the session, but retry after a prior failure so
-                          // a transient error does not permanently hide archives.
-                          if (open && op.status === 'success' && op.mirrorDestination &&
-                              !artifactsLoading[op.id]) {
-                            const listing = artifacts[op.id];
-                            if (!listing || listing.error) {
-                              void fetchArtifacts(op.id);
-                            }
-                          }
                         }}
                         toggle={(toggleRef) => (
                           <MenuToggle
@@ -1620,9 +1650,57 @@ const MirrorOperations: React.FC = () => {
                           )}
                           {op.status === 'success' && op.mirrorDestination && (() => {
                             const listing = artifacts[op.id];
-                            // While the fetch is in flight (or hasn't resolved yet), always
-                            // show a visible loading item so the user can see the feature exists.
-                            if (artifactsLoading[op.id] || !listing) {
+                            const listingReady =
+                              listing &&
+                              !listing.error &&
+                              Array.isArray(listing.artifacts) &&
+                              listing.artifacts.length > 0;
+
+                            // Prefer live listing (includes size). Fall back to artifactFiles
+                            // from the operation record so download links appear even if the
+                            // listing request is slow/failed — oc-mirror always reuses names
+                            // like mirror_000001.tar; persisted copies are served by op id.
+                            const archiveItems: { filename: string; sizeBytes?: number; downloadUrl: string }[] =
+                              listingReady
+                                ? listing!.artifacts
+                                : (op.artifactFiles ?? []).map((filename) => ({
+                                    filename,
+                                    downloadUrl:
+                                      `/api/operations/${encodeURIComponent(op.id)}` +
+                                      `/artifacts/${encodeURIComponent(filename)}/download`,
+                                  }));
+
+                            if (archiveItems.length > 0) {
+                              return archiveItems.map((artifact) => {
+                                // Prefer the persisted name (mirror_<shortId>.tar) so the
+                                // saved file matches the operation id shown in the table.
+                                const downloadName = artifact.filename;
+                                const sizeLabel =
+                                  typeof artifact.sizeBytes === 'number'
+                                    ? ` (${formatBytes(artifact.sizeBytes)})`
+                                    : '';
+
+                                return (
+                                  <DropdownItem
+                                    key={`${op.id}-archive-${artifact.filename}`}
+                                    icon={<DownloadIcon />}
+                                    component="a"
+                                    href={artifact.downloadUrl}
+                                    download={downloadName}
+                                    onClick={() => setKebabOpen((prev) => ({ ...prev, [op.id]: false }))}
+                                  >
+                                    {archiveItems.length === 1
+                                      ? `Download ${artifact.filename}${sizeLabel}`
+                                      : `${artifact.filename}${sizeLabel}`}
+                                  </DropdownItem>
+                                );
+                              });
+                            }
+
+                            // Only show the spinner while a request is actually in flight.
+                            // Previously `!listing` alone caused permanent "Loading archives…"
+                            // when onOpenChange never started the fetch.
+                            if (artifactsLoading[op.id]) {
                               return (
                                 <DropdownItem
                                   key={`${op.id}-archives-loading`}
@@ -1633,10 +1711,8 @@ const MirrorOperations: React.FC = () => {
                                 </DropdownItem>
                               );
                             }
-                            // Fetch completed but no archives found for this operation.
-                            // Guard against malformed responses (e.g. non-JSON from the
-                            // SPA catch-all) where listing.artifacts may be undefined.
-                            if (listing.error || !listing.artifacts || listing.artifacts.length === 0) {
+
+                            if (listing?.error || listing) {
                               return (
                                 <DropdownItem
                                   key={`${op.id}-archives-empty`}
@@ -1647,32 +1723,17 @@ const MirrorOperations: React.FC = () => {
                                 </DropdownItem>
                               );
                             }
-                            // Archives confirmed — show one download item per archive.
-                            return listing.artifacts.map((artifact) => {
-                              // Single archive: saved as "Mirror Operation abc12345.tar".
-                              // Multiple archives: include the original sequence name so the
-                              // user can tell them apart, e.g.
-                              // "Mirror Operation abc12345 - mirror_seq1_000000.tar".
-                              const downloadName =
-                                listing.artifacts.length === 1
-                                  ? `${op.name}.tar`
-                                  : `${op.name} - ${artifact.filename}`;
 
-                              return (
-                                <DropdownItem
-                                  key={`${op.id}-archive-${artifact.filename}`}
-                                  icon={<DownloadIcon />}
-                                  component="a"
-                                  href={artifact.downloadUrl}
-                                  download={downloadName}
-                                  onClick={() => setKebabOpen((prev) => ({ ...prev, [op.id]: false }))}
-                                >
-                                  {listing.artifacts.length === 1
-                                    ? `Download archive (${formatBytes(artifact.sizeBytes)})`
-                                    : `${artifact.filename} (${formatBytes(artifact.sizeBytes)})`}
-                                </DropdownItem>
-                              );
-                            });
+                            // Kebab just opened; effect will fetch. Brief pending state.
+                            return (
+                              <DropdownItem
+                                key={`${op.id}-archives-pending`}
+                                isDisabled
+                                icon={<DownloadIcon />}
+                              >
+                                <Spinner size="sm" aria-label="Loading archives" />{' '}Loading archives…
+                              </DropdownItem>
+                            );
                           })()}
                           {op.status === 'success' && op.mirrorDestination && (
                             <DropdownItem

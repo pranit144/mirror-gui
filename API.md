@@ -651,7 +651,7 @@ Start a new mirror operation.
 
 **Notes:**
 - oc-mirror writes archives into the shared destination `data/mirrors/{subdirectory}/` on the host (filenames such as `mirror_000001.tar` are reused across runs)
-- On successful completion, mirror-gui copies those archives into `data/artifacts/{operationId}/` so each operation keeps its own downloadable bytes across subsequent runs and container restarts
+- On successful completion, mirror-gui copies those archives into `data/artifacts/{operationId}/`, renaming each copy with the operation short id (e.g. `mirror_216e4f4f.tar`, matching "Mirror Operation 216e4f4f") so archives are easy to identify per operation and survive later runs that overwrite `mirror_000001.tar`
 - The shared destination (including `working-dir/`) remains the live oc-mirror workspace
 - The full host path is displayed in the operation details after completion
 

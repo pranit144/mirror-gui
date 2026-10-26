@@ -116,18 +116,21 @@ describe('Artifact persistence across overwrites', () => {
 
     const recordA = await waitForStatus(request, opAId);
     expect(recordA.status).toBe('success');
-    expect(recordA.artifactFiles).toEqual(['mirror_000001.tar']);
+    const shortA = opAId.replace(/-/g, '').slice(0, 8);
+    const archivedNameA = `mirror_${shortA}.tar`;
+    expect(recordA.artifactFiles).toEqual([archivedNameA]);
 
-    const persistedA = path.join(storageDir, 'artifacts', opAId, 'mirror_000001.tar');
+    const persistedA = path.join(storageDir, 'artifacts', opAId, archivedNameA);
     expect(fs.existsSync(persistedA)).toBe(true);
     expect(await fs.promises.readFile(persistedA, 'utf8')).toBe('operation-A-archive-payload');
 
     const listA1 = await request.get(`/api/operations/${opAId}/artifacts`);
     expect(listA1.status).toBe(200);
     expect(listA1.body.artifacts).toHaveLength(1);
+    expect(listA1.body.artifacts[0].filename).toBe(archivedNameA);
 
     const dlA1 = await request.get(
-      `/api/operations/${opAId}/artifacts/mirror_000001.tar/download`,
+      `/api/operations/${opAId}/artifacts/${archivedNameA}/download`,
     );
     expect(dlA1.status).toBe(200);
     expect(dlA1.text).toBe('operation-A-archive-payload');
@@ -147,7 +150,9 @@ describe('Artifact persistence across overwrites', () => {
 
     const recordB = await waitForStatus(request, opBId);
     expect(recordB.status).toBe('success');
-    expect(recordB.artifactFiles).toEqual(['mirror_000001.tar']);
+    const shortB = opBId.replace(/-/g, '').slice(0, 8);
+    const archivedNameB = `mirror_${shortB}.tar`;
+    expect(recordB.artifactFiles).toEqual([archivedNameB]);
 
     const sharedArchive = path.join(storageDir, 'mirrors', sharedSubdir, 'mirror_000001.tar');
     expect(await fs.promises.readFile(sharedArchive, 'utf8')).toBe('operation-B-archive-payload');
@@ -158,18 +163,20 @@ describe('Artifact persistence across overwrites', () => {
     const [listA2, listB, dlA2, dlB] = await Promise.all([
       request.get(`/api/operations/${opAId}/artifacts`),
       request.get(`/api/operations/${opBId}/artifacts`),
-      request.get(`/api/operations/${opAId}/artifacts/mirror_000001.tar/download`),
-      request.get(`/api/operations/${opBId}/artifacts/mirror_000001.tar/download`),
+      request.get(`/api/operations/${opAId}/artifacts/${archivedNameA}/download`),
+      request.get(`/api/operations/${opBId}/artifacts/${archivedNameB}/download`),
     ]);
 
     expect(listA2.status).toBe(200);
     expect(listA2.body.artifacts).toHaveLength(1);
+    expect(listA2.body.artifacts[0].filename).toBe(archivedNameA);
     expect(listA2.body.artifacts[0].sizeBytes).toBe(
       Buffer.byteLength('operation-A-archive-payload'),
     );
 
     expect(listB.status).toBe(200);
     expect(listB.body.artifacts).toHaveLength(1);
+    expect(listB.body.artifacts[0].filename).toBe(archivedNameB);
     expect(listB.body.artifacts[0].sizeBytes).toBe(
       Buffer.byteLength('operation-B-archive-payload'),
     );

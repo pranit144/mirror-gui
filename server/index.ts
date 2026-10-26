@@ -559,11 +559,41 @@ async function isRegularFile(filePath: string): Promise<boolean> {
   }
 }
 
+/** First 8 hex chars of the operation UUID — same suffix shown as "Mirror Operation abc12345". */
+function operationShortId(operationId: string): string {
+  return operationId.replace(/-/g, '').slice(0, 8);
+}
+
+/**
+ * Build a stable, operation-specific archive filename.
+ * oc-mirror always emits names like mirror_000001.tar; we rename the persisted
+ * copy so each operation is identifiable (e.g. mirror_216e4f4f.tar).
+ */
+function buildPersistedArchiveName(
+  operationId: string,
+  originalName: string,
+  index: number,
+  total: number,
+): string {
+  const shortId = operationShortId(operationId);
+  const extMatch = originalName.match(/(\.tar(?:\.gz)?|\.tgz)$/i);
+  const ext = extMatch?.[1] ?? '.tar';
+  if (total === 1) {
+    return `mirror_${shortId}${ext}`;
+  }
+  const seq = String(index + 1).padStart(6, '0');
+  return `mirror_${shortId}_${seq}${ext}`;
+}
+
 /**
  * Copy archives from the shared mirror destination into per-operation storage.
  * Uses a temp directory + rename so concurrent readers never see a partial copy.
  * Must use a real copy (not hardlink): oc-mirror overwrites the destination file
  * in place, which would mutate hardlinked "persisted" bytes.
+ *
+ * Persisted filenames include the operation short id (e.g. mirror_216e4f4f.tar)
+ * so archives are easy to identify per operation. The live oc-mirror destination
+ * keeps the original mirror_000001.tar name unchanged.
  */
 async function persistOperationArtifacts(
   operationId: string,
@@ -586,24 +616,34 @@ async function persistOperationArtifacts(
   await fsp.mkdir(tmpDir, { recursive: true });
 
   try {
+    const sources: string[] = [];
     for (const name of archiveNames) {
-      const src = path.join(mirrorDir, name);
-      // Re-check each file: skip if deleted mid-copy or replaced by a symlink.
-      if (!(await isRegularFile(src))) {
-        continue;
+      if (await isRegularFile(path.join(mirrorDir, name))) {
+        sources.push(name);
       }
-      await fsp.copyFile(src, path.join(tmpDir, name));
     }
 
-    const copied = (await fsp.readdir(tmpDir)).filter((n) => ARCHIVE_EXTENSION_PATTERN.test(n)).sort();
-    if (copied.length === 0) {
+    if (sources.length === 0) {
       await fsp.rm(tmpDir, { recursive: true, force: true });
       return [];
     }
 
+    const persistedNames: string[] = [];
+    for (let i = 0; i < sources.length; i += 1) {
+      const persistedName = buildPersistedArchiveName(
+        operationId,
+        sources[i],
+        i,
+        sources.length,
+      );
+      await fsp.copyFile(path.join(mirrorDir, sources[i]), path.join(tmpDir, persistedName));
+      persistedNames.push(persistedName);
+    }
+
+    persistedNames.sort();
     await fsp.rm(destDir, { recursive: true, force: true });
     await fsp.rename(tmpDir, destDir);
-    return copied;
+    return persistedNames;
   } catch (error) {
     await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
     throw error;
