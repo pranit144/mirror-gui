@@ -240,7 +240,17 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const DIST_DIR = path.join(__dirname, '../dist');
 const DEV_INDEX_HTML = path.join(__dirname, '../index.html');
 
-app.use(compression());
+app.use(compression({
+  // Never gzip archive downloads — multi-GB tars would hang the response and
+  // invalidate Content-Length. Cache-Control: no-transform alone is not enough
+  // for every client/proxy path.
+  filter: (req, res) => {
+    if (typeof req.path === 'string' && req.path.includes('/artifacts/') && req.path.endsWith('/download')) {
+      return false;
+    }
+    return compression.filter(req, res);
+  },
+}));
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -2402,17 +2412,31 @@ app.get('/api/operations/:id/artifacts/:filename/download', async (req: Request,
       return res.status(404).json({ error: 'Archive not found' });
     }
 
-    res.setHeader('Content-Disposition', `attachment; filename="${basename}"`);
     res.setHeader(
       'Content-Type',
       /\.(tar\.gz|tgz)$/i.test(basename) ? 'application/gzip' : 'application/x-tar',
     );
     res.setHeader('Content-Length', String(stats.size));
-    // The global compression() middleware (server/index.ts) would try to gzip a
-    // multi-GB tar, burning CPU and invalidating Content-Length. no-transform opts out.
-    res.setHeader('Cache-Control', 'no-transform');
+    res.setHeader('Accept-Ranges', 'bytes');
+    // no-transform + explicit identity encoding: keep proxies/browsers from
+    // re-encoding multi-GB archives (which breaks Content-Length / download).
+    res.setHeader('Cache-Control', 'no-store, no-transform');
+    res.setHeader('Content-Encoding', 'identity');
 
-    res.sendFile(resolvedFile);
+    // res.download sets Content-Disposition and streams the file. Absolute path
+    // is required; resolvedFile is already path.resolve()'d above.
+    res.download(resolvedFile, basename, (err) => {
+      if (err) {
+        // Client aborted (common when closing the tab mid multi-GB download).
+        if ((err as NodeJS.ErrnoException).code === 'ECONNABORTED' || res.headersSent) {
+          return;
+        }
+        console.error('Error streaming operation artifact:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to download archive' });
+        }
+      }
+    });
   } catch (error: unknown) {
     console.error('Error downloading operation artifact:', error);
     res.status(500).json({ error: 'Failed to download archive' });

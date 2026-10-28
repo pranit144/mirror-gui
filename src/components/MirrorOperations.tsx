@@ -1684,10 +1684,24 @@ const MirrorOperations: React.FC = () => {
                                   <DropdownItem
                                     key={`${op.id}-archive-${artifact.filename}`}
                                     icon={<DownloadIcon />}
-                                    component="a"
-                                    href={artifact.downloadUrl}
-                                    download={downloadName}
-                                    onClick={() => setKebabOpen((prev) => ({ ...prev, [op.id]: false }))}
+                                    onClick={(event) => {
+                                      // PatternFly menu selection closes/unmounts the item on
+                                      // click. If we rely on <a href>, that unmount cancels the
+                                      // browser download — especially for multi-GB archives.
+                                      event.preventDefault();
+                                      setKebabOpen((prev) => ({ ...prev, [op.id]: false }));
+                                      const url = artifact.downloadUrl;
+                                      const name = downloadName;
+                                      window.setTimeout(() => {
+                                        const link = document.createElement('a');
+                                        link.href = url;
+                                        link.download = name;
+                                        link.rel = 'noopener';
+                                        document.body.appendChild(link);
+                                        link.click();
+                                        link.remove();
+                                      }, 0);
+                                    }}
                                   >
                                     {archiveItems.length === 1
                                       ? `Download ${artifact.filename}${sizeLabel}`
